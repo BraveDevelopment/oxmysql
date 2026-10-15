@@ -1,70 +1,50 @@
-import { CFXParameters } from '../types';
+import type { CFXParameters } from '../types';
+import { normaliseValues } from './parseArguments';
 
-export const executeType = (query: string) => {
-  if (typeof query !== 'string') throw new Error(`Expected query to be a string but received ${typeof query} instead.`);
+export { statementType as executeType } from './sql';
 
-  switch (query.substring(0, query.indexOf(' '))) {
-    case 'INSERT':
-      return 'insert';
-    case 'UPDATE':
-      return 'update';
-    case 'DELETE':
-      return 'update';
-    default:
-      return null;
-  }
-};
+/** Arrays and plain objects (Lua tables) are parameter sets; Buffers, Dates etc. are values. */
+const isParameterSet = (value: unknown): value is object =>
+  Array.isArray(value) ||
+  (typeof value === 'object' && value !== null && Object.getPrototypeOf(value) === Object.prototype);
 
-export const parseExecute = (placeholders: number, parameters: CFXParameters) => {
-  const parametersType = typeof parameters;
+/** Converts a Lua-style `{ [1] = a, [3] = c }` object into a positional array. */
+function toArray(value: object, placeholders: number) {
+  if (Array.isArray(value)) return value;
 
-  if (!parameters || parametersType !== 'object') return [];
+  const arr: unknown[] = new Array(placeholders);
 
-  if (!Array.isArray(parameters)) {
-    if (typeof parameters === 'object') {
-      const arr: unknown[] = [];
-      Object.entries(parameters).forEach((entry) => (arr[parseInt(entry[0]) - 1] = entry[1]));
-      parameters = arr;
-    } else throw new Error(`Parameters expected an array but received ${typeof parameters} instead`);
+  for (const key in value) {
+    const index = parseInt(key, 10);
+    if (!Number.isInteger(index) || index < 1) throw new Error(`Invalid parameter key '${key}', expected 1-based indexes.`);
+    arr[index - 1] = (value as Record<string, unknown>)[key];
   }
 
-  if (!parameters.every(Array.isArray)) {
-    if (parameters.every((item) => typeof item === 'object')) {
-      const arr: unknown[][] = [];
+  return arr;
+}
 
-      parameters.forEach((value, index) => {
-        arr[index] = new Array(placeholders);
+/**
+ * Normalises prepare/rawExecute parameters into a list of parameter sets.
+ * - `[a, b]` / `{ [1] = a, [2] = b }` -> one set
+ * - `[[a, b], [c, d]]` / `[{ [1] = a }, ...]` -> one set per entry (batch)
+ */
+export const parseExecute = (placeholders: number, parameters: CFXParameters): unknown[][] => {
+  if (!parameters || typeof parameters !== 'object') return [normaliseValues([], placeholders)];
 
-        if (!Array.isArray(value)) {
-          Object.entries(value).forEach((entry) => {
-            arr[index][parseInt(entry[0]) - 1] = entry[1];
-          });
-        } else arr[index] = parameters[index];
+  let list: unknown[] = toArray(parameters, placeholders);
 
-        for (let i = 0; i < placeholders; i++) {
-          if (arr[index][i] === undefined) arr[index][i] = null;
-        }
-      });
+  if (list.length === 0) return [normaliseValues([], placeholders)];
 
-      parameters = arr;
-    } else parameters = [[...parameters]];
-  }
+  const isBatch = placeholders > 0 && list.every(isParameterSet);
 
-  return parameters;
-};
+  if (!isBatch) list = [list];
 
-export const parseValues = (placeholders: number, parameters: CFXParameters) => {
-  if (!Array.isArray(parameters)) {
-    if (typeof parameters === 'object') {
-      const arr: unknown[] = [];
-      Object.entries(parameters).forEach((entry) => (arr[parseInt(entry[0]) - 1] = entry[1]));
-      parameters = arr;
-    } else throw new Error(`Parameters expected an array but received ${typeof parameters} instead`);
-  } else if (placeholders > parameters.length) {
-    for (let i = parameters.length; i < placeholders; i++) {
-      parameters[i] = null;
-    }
-  }
+  return list.map((set) => {
+    const values = toArray(set as object, placeholders);
 
-  return parameters;
+    if (placeholders > 0 && values.length > placeholders)
+      throw new Error(`Expected ${placeholders} parameters, but received ${values.length}.`);
+
+    return normaliseValues(values, placeholders);
+  });
 };

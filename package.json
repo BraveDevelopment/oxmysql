@@ -1,13 +1,13 @@
 {
   "name": "oxmysql",
-  "version": "2.14.3",
-  "description": "FXServer to MySQL communication via node-mysql2",
-  "bugs": "https://github.com/overextended/oxmysql/issues",
+  "version": "3.0.0",
+  "description": "FXServer (Node 22) to MySQL/MariaDB communication via node-mysql2",
+  "bugs": "https://github.com/BraveDevelopment/oxmysql/issues",
   "license": "LGPL-3.0-or-later",
   "author": "Overextended",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/overextended/oxmysql.git"
+    "url": "git+https://github.com/BraveDevelopment/oxmysql.git"
   },
   "workspaces": [
     "./web"
@@ -27,12 +27,10 @@
     "lib": "tsc --project lib/tsconfig.lib.json",
     "test": "bun test tests/unit",
     "test:coverage": "bun test tests/unit --coverage",
-    "test:integration": "bun test tests/integration"
+    "test:integration": "bun run build:root && node tests/integration/fxserver.mjs"
   },
   "dependencies": {
-    "mysql2": "3.24.5",
-    "named-placeholders": "^1.1.6",
-    "node-fetch": "^3.3.2"
+    "mysql2": "3.24.5"
   },
   "devDependencies": {
     "@citizenfx/server": "2.0.29753-1",
@@ -46,7 +44,9 @@
     "typescript": "^6.0.3"
   },
   "patchedDependencies": {
-    "named-placeholders@1.1.6": "patches/named-placeholders@1.1.6.patch",
     "mysql2@3.24.5": "patches/mysql2@3.24.5.patch"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

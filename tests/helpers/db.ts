@@ -1,7 +1,7 @@
 import { mock } from 'bun:test';
 
 // Fake mysql2 PoolConnection that records the op sequence and returns scriptable results.
-export type Op = 'query' | 'execute' | 'begin' | 'commit' | 'rollback' | 'release';
+export type Op = 'query' | 'execute' | 'begin' | 'commit' | 'rollback' | 'release' | 'destroy';
 
 export interface FakeConnection {
   connection: { threadId: number };
@@ -9,11 +9,12 @@ export interface FakeConnection {
   queue: any[];
   failOn: Partial<Record<Op, unknown>>;
   query: (sql: any, values?: any) => Promise<[any, any]>;
-  execute: (opts: any) => Promise<[any, any]>;
+  execute: (sql: any, values?: any) => Promise<[any, any]>;
   beginTransaction: () => Promise<void>;
   commit: () => Promise<void>;
   rollback: () => Promise<void>;
   release: () => void;
+  destroy: () => void;
   ops: () => Op[];
 }
 
@@ -29,12 +30,20 @@ export function createFakeConnection(threadId = ++threadSeq + 1000): FakeConnect
     failOn: {},
     async query(sql, values) {
       calls.push({ op: 'query', arg: { sql, values } });
-      if (conn.failOn.query) throw conn.failOn.query;
+      const failure = conn.failOn.query;
+      if (typeof failure === 'function') {
+        const err = failure();
+        if (err) throw err;
+      } else if (failure) throw failure;
       return [nextResult(conn), []];
     },
-    async execute(opts) {
-      calls.push({ op: 'execute', arg: opts });
-      if (conn.failOn.execute) throw conn.failOn.execute;
+    async execute(sql, values) {
+      calls.push({ op: 'execute', arg: { sql, values } });
+      const failure = conn.failOn.execute;
+      if (typeof failure === 'function') {
+        const err = failure();
+        if (err) throw err;
+      } else if (failure) throw failure;
       return [nextResult(conn), []];
     },
     async beginTransaction() {
@@ -53,6 +62,9 @@ export function createFakeConnection(threadId = ++threadSeq + 1000): FakeConnect
     },
     release() {
       calls.push({ op: 'release' });
+    },
+    destroy() {
+      calls.push({ op: 'destroy' });
     },
     ops: () => calls.map((c) => c.op),
   };
@@ -91,7 +103,7 @@ export const fakePool = {
     if (event === 'connection') connectionHandler = handler;
   },
   async query() {
-    return [[{ version: '8.0.0-test' }]];
+    return [[{ version: '8.0.0-test', maxStatements: 16382 }]];
   },
   async getConnection() {
     const c = factory();

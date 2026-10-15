@@ -6,14 +6,15 @@ beforeEach(() => resetNatives());
 
 describe('getIsolationLevelStatement', () => {
   test('maps each level to its SQL statement', () => {
-    expect(config.getIsolationLevelStatement(1)).toBe('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ');
-    expect(config.getIsolationLevelStatement(2)).toBe('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
-    expect(config.getIsolationLevelStatement(3)).toBe('SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED');
-    expect(config.getIsolationLevelStatement(4)).toBe('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
+    // SESSION scope: without it the level only applies to the next transaction
+    expect(config.getIsolationLevelStatement(1)).toBe('SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ');
+    expect(config.getIsolationLevelStatement(2)).toBe('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED');
+    expect(config.getIsolationLevelStatement(3)).toBe('SET SESSION TRANSACTION ISOLATION LEVEL READ UNCOMMITTED');
+    expect(config.getIsolationLevelStatement(4)).toBe('SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE');
   });
 
   test('falls back to READ COMMITTED for unknown levels', () => {
-    expect(config.getIsolationLevelStatement(99)).toBe('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+    expect(config.getIsolationLevelStatement(99)).toBe('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED');
   });
 });
 
@@ -65,20 +66,71 @@ describe('getConnectionOptions', () => {
     expect(opts.ssl).toEqual({ rejectUnauthorized: false });
   });
 
-  test('logs but does not throw on malformed ssl JSON', () => {
-    const log = spyOn(console, 'log').mockImplementation(() => {});
+  test('warns and drops malformed ssl JSON instead of throwing', () => {
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
     const opts = config.getConnectionOptions('host=h;ssl={bad json') as any;
-    expect(opts.ssl).toBe('{bad json'); // left as the raw string
-    expect(log).toHaveBeenCalled();
-    log.mockRestore();
+    expect(opts.ssl).toBeUndefined();
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
   });
 
-  test('disables our placeholder converter when namedPlaceholders=false', () => {
+  test('disables named placeholders when namedPlaceholders=false', () => {
     config.getConnectionOptions('host=h;database=db;namedPlaceholders=false');
-    expect(config.convertNamedPlaceholders).toBeNull();
+    expect(config.namedPlaceholdersEnabled).toBe(false);
 
     config.getConnectionOptions('mysql://localhost/db');
-    expect(typeof config.convertNamedPlaceholders).toBe('function');
+    expect(config.namedPlaceholdersEnabled).toBe(true);
+  });
+
+  test('coerces "false"/"true" strings into booleans (a non-empty string is truthy)', () => {
+    const opts = config.getConnectionOptions(
+      'mysql://localhost/db?waitForConnections=false&decimalNumbers=true&supportBigNumbers=false&someFlag=false',
+    ) as any;
+    expect(opts.waitForConnections).toBe(false);
+    expect(opts.decimalNumbers).toBe(true);
+    expect(opts.supportBigNumbers).toBe(false);
+    expect(opts.someFlag).toBe(false);
+  });
+
+  test('coerces numeric options and keeps numeric-looking strings for string options', () => {
+    const opts = config.getConnectionOptions('host=h;user=1234;password=0042;connectionLimit=25;queueLimit=0') as any;
+    expect(opts.connectionLimit).toBe(25);
+    expect(opts.queueLimit).toBe(0);
+    expect(opts.user).toBe('1234');
+    expect(opts.password).toBe('0042');
+  });
+
+  test('decodes URI-encoded credentials, including : @ and / in the password', () => {
+    const opts = config.getConnectionOptions('mysql://us%40er:p%40ss%3Aw%2Frd@db.host/my%20db') as any;
+    expect(opts.user).toBe('us@er');
+    expect(opts.password).toBe('p@ss:w/rd');
+    expect(opts.database).toBe('my db');
+  });
+
+  test('keeps "=" inside key-value passwords', () => {
+    const opts = config.getConnectionOptions('host=h;user=u;password=a=b==;database=d') as any;
+    expect(opts.password).toBe('a=b==');
+  });
+
+  test('accepts IPv6 hosts and mariadb:// URIs', () => {
+    const opts = config.getConnectionOptions('mariadb://root@[::1]:3307/db') as any;
+    expect(opts.host).toBe('::1');
+    expect(opts.port).toBe(3307);
+  });
+
+  test('applies prepared statement and queue defaults, overridable', () => {
+    const defaults = config.getConnectionOptions('mysql://localhost/db') as any;
+    expect(defaults.maxPreparedStatements).toBe(config.DEFAULT_MAX_PREPARED_STATEMENTS);
+    expect(defaults.queueLimit).toBe(config.DEFAULT_QUEUE_LIMIT);
+
+    const custom = config.getConnectionOptions('mysql://localhost/db?maxPreparedStatements=100') as any;
+    expect(custom.maxPreparedStatements).toBe(100);
+  });
+
+  test('normalises the timezone option ("+" in a URI decodes to a space)', () => {
+    expect((config.getConnectionOptions('mysql://localhost/db?timezone=+02:00') as any).timezone).toBe('+02:00');
+    expect((config.getConnectionOptions('mysql://localhost/db?timezone=Z') as any).timezone).toBe('Z');
+    expect((config.getConnectionOptions('mysql://localhost/db') as any).timezone).toBe('local');
   });
 });
 

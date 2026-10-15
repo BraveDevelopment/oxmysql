@@ -1,161 +1,78 @@
 import type { CFXCallback, CFXParameters, TransactionQuery } from './types';
-import { rawQuery, rawExecute, rawTransaction, pool } from './database';
-import { startTransaction } from 'database/startTransaction';
-import { sleep } from 'utils/sleep';
-import ghmatti from './compatibility/ghmattimysql';
-import mysqlAsync from './compatibility/mysql-async';
-import('./update');
+import { rawQuery, rawExecute, rawTransaction, startTransaction, pool, poolReady } from './database';
+import './update';
+
+type QueryExport = (
+  query: any,
+  parameters: CFXParameters | CFXCallback | undefined,
+  cb: CFXCallback | undefined,
+  invokingResource?: string,
+  isPromise?: boolean,
+) => void;
+
+/**
+ * Query exports share one signature: (query, parameters?, callback?, invokingResource?, isPromise?).
+ * The Lua (lib/MySQL.lua) and JS (lib/MySQL.ts) wrappers fill in the last two arguments.
+ */
+const queries: Record<string, QueryExport> = {
+  query: (query, parameters = [], cb, invokingResource = GetInvokingResource(), isPromise) =>
+    rawQuery(null, invokingResource, query, parameters as CFXParameters, cb, isPromise),
+
+  single: (query, parameters = [], cb, invokingResource = GetInvokingResource(), isPromise) =>
+    rawQuery('single', invokingResource, query, parameters as CFXParameters, cb, isPromise),
+
+  scalar: (query, parameters = [], cb, invokingResource = GetInvokingResource(), isPromise) =>
+    rawQuery('scalar', invokingResource, query, parameters as CFXParameters, cb, isPromise),
+
+  update: (query, parameters = [], cb, invokingResource = GetInvokingResource(), isPromise) =>
+    rawQuery('update', invokingResource, query, parameters as CFXParameters, cb, isPromise),
+
+  insert: (query, parameters = [], cb, invokingResource = GetInvokingResource(), isPromise) =>
+    rawQuery('insert', invokingResource, query, parameters as CFXParameters, cb, isPromise),
+
+  transaction: (queries: TransactionQuery, parameters = [], cb, invokingResource = GetInvokingResource(), isPromise) =>
+    rawTransaction(invokingResource, queries, parameters as CFXParameters, cb, isPromise),
+
+  prepare: (query, parameters = [], cb, invokingResource = GetInvokingResource(), isPromise) =>
+    rawExecute(invokingResource, query, parameters as CFXParameters, cb, isPromise, true),
+
+  rawExecute: (query, parameters = [], cb, invokingResource = GetInvokingResource(), isPromise) =>
+    rawExecute(invokingResource, query, parameters as CFXParameters, cb, isPromise),
+};
 
 const MySQL = {
-  isReady: () => {
-    return pool ? true : false;
-  },
+  ...queries,
+
+  isReady: () => !!pool,
 
   awaitConnection: async () => {
-    while (!pool) await sleep(0);
-
+    await poolReady;
     return true;
   },
 
-  query: (
-    query: string,
-    parameters: CFXParameters = [],
-    cb: CFXCallback,
-    invokingResource = GetInvokingResource(),
-    isPromise?: boolean,
-  ) => {
-    rawQuery(null, invokingResource, query, parameters, cb, isPromise);
-  },
-
-  single: (
-    query: string,
-    parameters: CFXParameters = [],
-    cb: CFXCallback,
-    invokingResource = GetInvokingResource(),
-    isPromise?: boolean,
-  ) => {
-    rawQuery('single', invokingResource, query, parameters, cb, isPromise);
-  },
-
-  scalar: (
-    query: string,
-    parameters: CFXParameters = [],
-    cb: CFXCallback,
-    invokingResource = GetInvokingResource(),
-    isPromise?: boolean,
-  ) => {
-    rawQuery('scalar', invokingResource, query, parameters, cb, isPromise);
-  },
-
-  update: (
-    query: string,
-    parameters: CFXParameters = [],
-    cb: CFXCallback,
-    invokingResource = GetInvokingResource(),
-    isPromise?: boolean,
-  ) => {
-    rawQuery('update', invokingResource, query, parameters, cb, isPromise);
-  },
-
-  insert: (
-    query: string,
-    parameters: CFXParameters = [],
-    cb: CFXCallback,
-    invokingResource = GetInvokingResource(),
-    isPromise?: boolean,
-  ) => {
-    rawQuery('insert', invokingResource, query, parameters, cb, isPromise);
-  },
-
-  transaction: (
-    queries: TransactionQuery,
-    parameters: CFXParameters = [],
-    cb: CFXCallback,
-    invokingResource = GetInvokingResource(),
-    isPromise?: boolean,
-  ) => {
-    rawTransaction(invokingResource, queries, parameters, cb, isPromise);
-  },
-
-  startTransaction: (transactions: () => Promise<boolean>, invokingResource = GetInvokingResource()) => {
-    return startTransaction(invokingResource, transactions, undefined, true);
-  },
-
-  prepare: (
-    query: string,
-    parameters: CFXParameters = [],
-    cb: CFXCallback,
-    invokingResource = GetInvokingResource(),
-    isPromise?: boolean,
-  ) => {
-    rawExecute(invokingResource, query, parameters, cb, isPromise, true);
-  },
-
-  rawExecute: (
-    query: string,
-    parameters: CFXParameters = [],
-    cb: CFXCallback,
-    invokingResource = GetInvokingResource(),
-    isPromise?: boolean,
-  ) => {
-    rawExecute(invokingResource, query, parameters, cb, isPromise);
-  },
-
-  // provide the store export for compatibility (ghmatti/mysql-async); simply returns the query as-is
-  store: (query: string, cb: Function) => {
-    cb(query);
-  },
+  startTransaction: (fn: Parameters<typeof startTransaction>[1], invokingResource = GetInvokingResource()) =>
+    startTransaction(invokingResource, fn),
 };
 
-// @ts-expect-error deprecated export
-MySQL.execute = MySQL.query;
-// @ts-expect-error deprecated export
-MySQL.fetch = MySQL.query;
+const exportFn = global.exports as unknown as (name: string, fn: Function) => void;
 
-function provide(resourceName: string, method: string, cb: Function) {
-  on(`__cfx_export_${resourceName}_${method}`, (setCb: Function) => setCb(cb));
-}
+for (const [name, fn] of Object.entries(MySQL)) exportFn(name, fn);
 
-const exports = global.exports;
-
-for (const key in MySQL) {
-  const exp = (MySQL as any)[key];
-
-  const async_exp = (query: string, parameters: CFXParameters = [], invokingResource = GetInvokingResource()) => {
-    return new Promise((resolve, reject) => {
-      exp(
-        query,
-        parameters,
-        (result: unknown, err: string) => {
-          if (err) return reject(new Error(err));
-          resolve(result);
-        },
-        invokingResource,
-        true,
-      );
-    });
-  };
-
-  try {
-    exports(key, exp);
-    // async_retval
-    exports(`${key}_async`, async_exp);
-    // deprecated aliases for async_retval
-    exports(`${key}Sync`, async_exp);
-
-    let alias = (ghmatti as any)[key];
-
-    if (alias) {
-      provide('ghmattimysql', alias, exp);
-      provide('ghmattimysql', `${alias}Sync`, async_exp);
-    }
-
-    alias = (mysqlAsync as any)[key];
-
-    if (alias) {
-      provide('mysql-async', alias, exp);
-    }
-  } catch {}
+// promise-returning variants used by the JS wrapper (lib/MySQL.ts)
+for (const [name, fn] of Object.entries(queries)) {
+  exportFn(
+    `${name}_async`,
+    (query: any, parameters: CFXParameters = [], invokingResource = GetInvokingResource()) =>
+      new Promise((resolve, reject) => {
+        fn(
+          query,
+          parameters,
+          (result: unknown, err?: string) => (err ? reject(new Error(err)) : resolve(result)),
+          invokingResource,
+          true,
+        );
+      }),
+  );
 }
 
 export default MySQL;

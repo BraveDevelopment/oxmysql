@@ -23,7 +23,35 @@ describe('createConnectionPool', () => {
 
     const conn = createFakeConnection();
     handler!(conn as any);
-    expect(conn.calls[0].arg.sql).toBe('SET TRANSACTION ISOLATION LEVEL READ COMMITTED');
+    expect(conn.calls[0].arg.sql).toBe('SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED');
+    // errors are reported through a callback instead of becoming unhandled
+    expect(typeof conn.calls[0].arg.values).toBe('function');
+  });
+
+  test('pins the session time_zone when a timezone is configured', async () => {
+    const config = await import('config');
+
+    config.getConnectionOptions('mysql://localhost/db?timezone=Z');
+    expect(poolModule.sessionStatements()).toContain("SET time_zone = '+00:00'");
+
+    config.getConnectionOptions('mysql://localhost/db?timezone=-05:00');
+    expect(poolModule.sessionStatements()).toContain("SET time_zone = '-05:00'");
+
+    config.getConnectionOptions('mysql://localhost/db');
+    expect(poolModule.sessionStatements()).toEqual(['SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED']);
+  });
+
+  test('warns when cached prepared statements could exceed max_prepared_stmt_count', async () => {
+    const { fakePool } = await import('../../helpers/db');
+    const original = fakePool.query;
+    fakePool.query = async () => [[{ version: '8.0.0-test', maxStatements: 1000 }]] as any;
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+
+    await poolModule.createConnectionPool();
+
+    expect(warn.mock.calls.some((c) => String(c[0]).includes('max_prepared_stmt_count'))).toBe(true);
+    warn.mockRestore();
+    fakePool.query = original;
   });
 
   test('logs a diagnostic instead of throwing when the pool cannot be created', async () => {

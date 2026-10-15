@@ -1,37 +1,50 @@
 import type { CFXParameters } from '../types';
-import { convertNamedPlaceholders } from '../config';
+import { mysql_strict_params, namedPlaceholdersEnabled } from '../config';
+import { compileNamedPlaceholders, countPlaceholders } from './sql';
+
+/** Replaces undefined with null (JS sparse arrays / missing values); throws instead in strict mode. */
+export function normaliseValues(values: unknown[], placeholders: number, strict = mysql_strict_params) {
+  if (strict && values.length < placeholders)
+    throw new Error(`Expected ${placeholders} parameters, but received ${values.length}.`);
+
+  const length = Math.max(values.length, placeholders);
+  const output = new Array(length);
+
+  for (let i = 0; i < length; i++) {
+    const value = values[i];
+
+    if (value === undefined) {
+      if (strict) throw new Error(`Parameter ${i + 1} is undefined.`);
+      output[i] = null;
+    } else output[i] = value;
+  }
+
+  return output;
+}
 
 export const parseArguments = (query: string, parameters?: CFXParameters): [string, CFXParameters] => {
   if (typeof query !== 'string') throw new Error(`Expected query to be a string but received ${typeof query} instead.`);
 
-  if (convertNamedPlaceholders && parameters && typeof parameters === 'object' && !Array.isArray(parameters))
-    if (query.includes(':') || query.includes('@')) {
-      [query, parameters] = convertNamedPlaceholders(query, parameters);
-    }
-
   if (!parameters || typeof parameters === 'function') parameters = [];
 
-  const placeholders = query.match(/\?(?!\?)/g)?.length ?? 0;
-
-  if (parameters && !Array.isArray(parameters)) {
-    let arr: unknown[] = [];
-
-    for (let i = 0; i < placeholders; i++) {
-      arr[i] = parameters[i + 1] ?? null;
-    }
-
-    parameters = arr;
-  } else {
-    if (placeholders) {
-      const diff = placeholders - parameters.length;
-
-      if (diff > 0) {
-        parameters = [...parameters, ...new Array(diff).fill(null)];
-      } else if (diff < 0) {
-        throw new Error(`Expected ${placeholders} parameters, but received ${parameters.length}.`);
-      }
-    }
+  if (namedPlaceholdersEnabled && typeof parameters === 'object' && !Array.isArray(parameters)) {
+    const compiled = compileNamedPlaceholders(query, parameters, { strict: mysql_strict_params });
+    if (compiled) return compiled as [string, CFXParameters];
   }
 
-  return [query, parameters];
+  const placeholders = countPlaceholders(query);
+
+  // Lua tables with holes arrive as objects keyed by 1-based index
+  if (!Array.isArray(parameters)) {
+    const arr: unknown[] = [];
+
+    for (let i = 0; i < placeholders; i++) arr[i] = (parameters as Record<number, unknown>)[i + 1];
+
+    parameters = arr;
+  }
+
+  if (parameters.length > placeholders && placeholders > 0)
+    throw new Error(`Expected ${placeholders} parameters, but received ${parameters.length}.`);
+
+  return [query, normaliseValues(parameters, placeholders)];
 };
