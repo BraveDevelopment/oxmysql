@@ -1,6 +1,6 @@
 import { mysql_debug, mysql_log_size, mysql_slow_query_warning, mysql_ui } from '../config';
 import type { CFXCallback, CFXParameters } from '../types';
-import { dbVersion } from '../database';
+import { dbVersion } from '../database/pool';
 
 let loggerResource = '';
 let loggerService = GetConvar('mysql_logger_service', '');
@@ -9,30 +9,48 @@ if (loggerService) {
   if (loggerService.startsWith('@')) {
     const [resource, ...path] = loggerService.slice(1).split('/');
 
-    if (resource && path) {
+    if (resource && path.length) {
       loggerResource = resource;
       loggerService = path.join('/');
     }
   } else loggerService = `logger/${loggerService}`;
 }
 
-export const logger =
+export const logger: (data: { level: string; resource: string; message: string; metadata?: unknown }) => void =
   (loggerService &&
     new Function(LoadResourceFile(loggerResource || GetCurrentResourceName(), `${loggerService}.js`))()) ||
   (() => {});
 
+/** Invokes a callback from another resource, reporting script errors instead of letting them escape. */
+export function invokeCallback(invokingResource: string, cb: CFXCallback, result: unknown, err?: string) {
+  try {
+    return err === undefined ? cb(result) : cb(result, err);
+  } catch (e) {
+    const message = typeof e === 'string' ? e : e instanceof Error ? e.message : String(e);
+    if (message.includes('SCRIPT ERROR:')) return console.log(message);
+    console.log(`^1SCRIPT ERROR in invoking resource ${invokingResource}: ${message}^0`);
+  }
+}
+
+/**
+ * Reports a failed query. The callback is always invoked with `(null, message)` so callers never hang:
+ * promise/await callers reject, callback-style callers receive the error as their second argument.
+ */
 export function logError(
   invokingResource: string,
   cb: CFXCallback | undefined,
   isPromise: boolean | undefined,
-  err: any | string = '', // i cbf typing the error right now
+  err: any = '',
   query?: string,
   parameters?: CFXParameters,
   includeParameters?: boolean,
 ) {
-  const message = typeof err === 'object' ? err.message : err.replace(/SCRIPT ERROR: citizen:[\w\/\.]+:\d+[:\s]+/, '');
+  const message =
+    typeof err === 'object' && err !== null
+      ? err.message
+      : String(err).replace(/SCRIPT ERROR: citizen:[\w\/\.]+:\d+[:\s]+/, '');
 
-  const output = `${invokingResource} was unable to execute a query!${query ? `\n${`Query: ${query}`}` : ''}${
+  const output = `${invokingResource} was unable to execute a query!${query ? `\nQuery: ${query}` : ''}${
     includeParameters ? `\n${JSON.stringify(parameters)}` : ''
   }\n${message}`;
 
@@ -44,7 +62,7 @@ export function logError(
     resource: invokingResource,
   });
 
-  if (typeof err === 'object' && err.message) delete err.sqlMessage;
+  if (typeof err === 'object' && err?.message) delete err.sqlMessage;
 
   logger({
     level: 'error',
@@ -53,27 +71,73 @@ export function logError(
     metadata: err,
   });
 
-  if (cb && isPromise) {
-    try {
-      return cb(null, output);
-    } catch (e) {}
+  // awaiting callers get the error thrown at the call site, so don't print it twice
+  if (!isPromise) console.error(output);
 
-    return;
-  }
-
-  console.error(output);
+  if (cb) invokeCallback(invokingResource, cb, null, output);
 }
 
-interface QueryData {
+const warnedMultiRow = new Set<string>();
+
+/** Warns once per query when single/scalar transferred more rows than it uses. */
+export function warnMultiRow(invokingResource: string, type: string, query: string, rows: number) {
+  const key = `${invokingResource}\0${query}`;
+
+  if (warnedMultiRow.has(key)) return;
+  if (warnedMultiRow.size > 1000) warnedMultiRow.clear();
+
+  warnedMultiRow.add(key);
+
+  console.warn(
+    `^3${invokingResource} used ${type}() on a query returning ${rows} rows; only the first is used. ` +
+      `Add 'LIMIT 1' so the server stops after one row.\n${query}^0`,
+  );
+}
+
+export interface QueryData {
   date: number;
   query: string;
   executionTime: number;
   slow?: boolean;
 }
 
-type QueryLog = Record<string, QueryData[]>;
+/** Fixed-size log per resource; pushing is O(1) instead of shifting the whole array. */
+export class QueryRing {
+  private items: QueryData[] = [];
+  private head = 0;
 
-const logStorage: QueryLog = {};
+  constructor(private capacity: number) {}
+
+  push(item: QueryData, capacity: number) {
+    if (capacity !== this.capacity) {
+      const current = this.toArray().slice(-capacity);
+      this.items = current;
+      this.head = 0;
+      this.capacity = capacity;
+    }
+
+    if (this.capacity <= 0) return;
+
+    if (this.items.length < this.capacity) {
+      this.items.push(item);
+      return;
+    }
+
+    this.items[this.head] = item;
+    this.head = (this.head + 1) % this.capacity;
+  }
+
+  get length() {
+    return this.items.length;
+  }
+
+  /** Oldest first. */
+  toArray() {
+    return this.head === 0 ? this.items.slice() : this.items.slice(this.head).concat(this.items.slice(0, this.head));
+  }
+}
+
+const logStorage: Record<string, QueryRing> = {};
 
 export const logQuery = (
   invokingResource: string,
@@ -94,15 +158,17 @@ export const logQuery = (
 
   if (!mysql_ui) return;
 
-  if (!logStorage[invokingResource]) logStorage[invokingResource] = [];
-  else if (logStorage[invokingResource].length > mysql_log_size) logStorage[invokingResource].splice(0, 1);
+  const log = (logStorage[invokingResource] ??= new QueryRing(mysql_log_size));
 
-  logStorage[invokingResource].push({
-    query,
-    executionTime,
-    date: Date.now(),
-    slow: executionTime >= mysql_slow_query_warning ? true : undefined,
-  });
+  log.push(
+    {
+      query,
+      executionTime,
+      date: Date.now(),
+      slow: executionTime >= mysql_slow_query_warning ? true : undefined,
+    },
+    mysql_log_size,
+  );
 };
 
 RegisterCommand(
@@ -111,29 +177,31 @@ RegisterCommand(
     if (!mysql_ui) return;
 
     if (source < 1) {
-      // source is 0 when received from the server
       console.log('^3This command cannot run server side^0');
       return;
     }
 
-    let totalQueries: number = 0;
+    let totalQueries = 0;
     let totalTime = 0;
     let slowQueries = 0;
-    let chartData: { labels: string[]; data: { queries: number; time: number }[] } = {
+    const chartData: { labels: string[]; data: { queries: number; time: number }[] } = {
       labels: [],
       data: [],
     };
 
     for (const resource in logStorage) {
-      const queries = logStorage[resource];
-      let totalResourceTime = 0;
+      const queries = logStorage[resource].toArray();
+      let resourceTime = 0;
+
+      for (const query of queries) {
+        resourceTime += query.executionTime;
+        if (query.slow) slowQueries++;
+      }
 
       totalQueries += queries.length;
-      totalTime += queries.reduce((totalTime, query) => (totalTime += query.executionTime), 0);
-      slowQueries += queries.reduce((slowQueries, query) => (slowQueries += query.slow ? 1 : 0), 0);
-      totalResourceTime += queries.reduce((totalResourceTime, query) => (totalResourceTime += query.executionTime), 0);
+      totalTime += resourceTime;
       chartData.labels.push(resource);
-      chartData.data.push({ queries: queries.length, time: totalResourceTime });
+      chartData.data.push({ queries: queries.length, time: resourceTime });
     }
 
     emitNet(`oxmysql:openUi`, source, {
@@ -172,7 +240,7 @@ onNet(
   }) => {
     if (typeof data.resource !== 'string' || !IsPlayerAceAllowed(source as unknown as string, 'command.mysql')) return;
 
-    const storedQueries = logStorage[data.resource];
+    const storedQueries = logStorage[data.resource]?.toArray();
 
     if (!storedQueries) return;
 
@@ -188,15 +256,10 @@ onNet(
     const queries = sort ? sortQueries(resourceLog, sort).slice(startRow, endRow) : resourceLog.slice(startRow, endRow);
     const pageCount = Math.ceil(resourceLog.length / 10);
 
-    if (!queries) return;
-
     let resourceTime = 0;
     let resourceSlowQueries = 0;
-    const resourceQueriesCount = resourceLog.length;
 
-    for (let i = 0; i < resourceQueriesCount; i++) {
-      const query = resourceLog[i];
-
+    for (const query of resourceLog) {
       resourceTime += query.executionTime;
       if (query.slow) resourceSlowQueries += 1;
     }
@@ -204,7 +267,7 @@ onNet(
     emitNet(`oxmysql:loadResource`, source, {
       queries,
       pageCount,
-      resourceQueriesCount,
+      resourceQueriesCount: resourceLog.length,
       resourceSlowQueries,
       resourceTime,
     });

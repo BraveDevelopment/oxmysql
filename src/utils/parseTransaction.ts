@@ -1,34 +1,41 @@
-import { CFXParameters, TransactionQuery } from '../types';
+import type { CFXParameters, TransactionQuery, TransactionStatement } from '../types';
 import { parseArguments } from './parseArguments';
 
-const isTransactionQuery = (query: TransactionQuery | string): query is TransactionQuery =>
-  (query as TransactionQuery).query !== undefined;
-
+/**
+ * Accepts every transaction form, also mixed:
+ * - `'sql'` (uses the shared `parameters`)
+ * - `['sql', params]`
+ * - `{ query: 'sql', parameters | values: params }`
+ */
 export const parseTransaction = (queries: TransactionQuery, parameters: CFXParameters) => {
   if (!Array.isArray(queries)) throw new Error(`Transaction queries must be array, received '${typeof queries}'.`);
+  if (queries.length === 0) throw new Error('Transaction requires at least one query.');
 
   if (!parameters || typeof parameters === 'function') parameters = [];
 
-  if (Array.isArray(queries[0])) {
-    const transactions = queries.map((query) => {
-      if (typeof query[1] !== 'object')
-        throw new Error(`Transaction parameters must be array or object, received '${typeof query[1]}'.`);
-      const [parsedQuery, parsedParameters] = parseArguments(query[0], query[1]);
+  return queries.map((entry) => {
+    let query: unknown;
+    let params: CFXParameters;
 
-      return { query: parsedQuery, params: parsedParameters };
-    });
+    if (typeof entry === 'string') {
+      query = entry;
+      params = parameters;
+    } else if (Array.isArray(entry)) {
+      if (entry[1] !== undefined && typeof entry[1] !== 'object')
+        throw new Error(`Transaction parameters must be array or object, received '${typeof entry[1]}'.`);
 
-    return transactions;
-  }
+      query = entry[0];
+      params = entry[1] ?? [];
+    } else if (entry && typeof entry === 'object') {
+      const statement = entry as TransactionStatement;
+      query = statement.query;
+      params = statement.parameters ?? statement.values ?? parameters;
+    } else {
+      throw new Error(`Invalid transaction entry of type '${typeof entry}'.`);
+    }
 
-  const transactions = queries.map((query) => {
-    const [parsedQuery, parsedParameters] = parseArguments(
-      isTransactionQuery(query) ? query.query : query,
-      isTransactionQuery(query) ? query.parameters || query.values : parameters,
-    );
+    const [parsedQuery, parsedParameters] = parseArguments(query as string, params);
 
     return { query: parsedQuery, params: parsedParameters };
   });
-
-  return transactions;
 };

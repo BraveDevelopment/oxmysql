@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach } from 'bun:test';
+import { describe, test, expect, beforeEach, spyOn } from 'bun:test';
 import '../../setup';
 import { resetDb, setConnectionFactory, createFakeConnection } from '../../helpers/db';
 
@@ -26,15 +26,14 @@ describe('MySql wrapper', () => {
     expect(fake.calls[0]).toEqual({ op: 'query', arg: { sql: 'SELECT ?', values: [1] } });
   });
 
-  test('execute() unwraps the result and passes the binary typeCast', async () => {
+  test('execute() unwraps the result (typecasting comes from the pool config)', async () => {
     const fake = createFakeConnection();
     fake.queue.push({ affectedRows: 2 });
     const c = new MySql(fake as any);
 
     const result = await c.execute('UPDATE t SET a = ?', [1]);
     expect(result).toEqual({ affectedRows: 2 });
-    expect(fake.calls[0].arg.sql).toBe('UPDATE t SET a = ?');
-    expect(typeof fake.calls[0].arg.typeCast).toBe('function');
+    expect(fake.calls[0].arg).toEqual({ sql: 'UPDATE t SET a = ?', values: [1] });
   });
 
   test('beginTransaction sets the flag; commit/rollback clear it', async () => {
@@ -91,22 +90,44 @@ describe('getConnection', () => {
     expect(conn!.id).toBe(123);
   });
 
-  test('returns a non-owning handle for an existing connection id', async () => {
-    const fake = createFakeConnection(777);
-    setConnectionFactory(() => fake);
-    const owner = await getConnection(); // registers activeConnections[777]
-    await owner!.beginTransaction();
+  test('fails with a clear error when no connection frees up in time', async () => {
+    const { fakePool } = await import('../../helpers/db');
+    const original = fakePool.getConnection;
+    let resolveLate: (c: any) => void = () => {};
+    const late = createFakeConnection(555);
 
-    const borrowed = await getConnection(777);
-    expect(borrowed).toBeDefined();
+    fakePool.getConnection = () => new Promise((resolve) => (resolveLate = resolve)) as any;
 
-    // queries still work through the borrowed handle
-    fake.queue.push([{ ok: 1 }]);
-    expect(await borrowed!.query('SELECT 1')).toEqual([{ ok: 1 }]);
+    const { AcquireTimeoutError } = await import('database/connection');
 
-    // disposing the borrow must NOT roll back or release the owner's connection
-    await asyncDispose(borrowed);
-    expect(fake.ops()).not.toContain('rollback');
-    expect(fake.ops()).not.toContain('release');
+    // fire the acquire timeout immediately
+    const timers = spyOn(globalThis, 'setTimeout').mockImplementation(((fn: Function) => {
+      fn();
+      return 0 as any;
+    }) as any);
+
+    await expect(getConnection()).rejects.toBeInstanceOf(AcquireTimeoutError);
+    timers.mockRestore();
+
+    // a connection handed out after the timeout goes straight back to the pool
+    resolveLate(late);
+    await new Promise((r) => setImmediate(r));
+    expect(late.ops()).toEqual(['release']);
+
+    fakePool.getConnection = original;
+  });
+});
+
+describe('destroy', () => {
+  test('destroys the socket and skips release/rollback on dispose', async () => {
+    const fake = createFakeConnection();
+    const c = new MySql(fake as any);
+    await c.beginTransaction();
+
+    c.destroy();
+    c.destroy(); // idempotent
+    await asyncDispose(c);
+
+    expect(fake.ops()).toEqual(['begin', 'destroy']);
   });
 });

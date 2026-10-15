@@ -42,24 +42,10 @@ beforeEach(() => {
   nextError = undefined;
 });
 
-describe('store', () => {
-  test('accepts a string and returns a usable 0-based reference', async () => {
-    const ref = oxmysql.store('SELECT 1');
-    expect(typeof ref).toBe('number');
-  });
-
-  test('throws when given a non-string', () => {
-    expect(() => oxmysql.store(5 as any)).toThrow('Query expects a string');
-  });
-});
-
 describe('argument validation (safeArgs)', () => {
-  test('rejects a non-string, non-number query', () => {
-    expect(oxmysql.query({} as any)).rejects.toThrow('First argument expected string');
-  });
-
-  test('rejects an out-of-range query-store reference', () => {
-    expect(oxmysql.query(9999 as any)).rejects.toThrow('invalid query store reference');
+  test('rejects a non-string query (numeric query-store references were removed)', async () => {
+    await expect(oxmysql.query({} as any)).rejects.toThrow('First argument expected string');
+    await expect(oxmysql.query(1 as any)).rejects.toThrow('First argument expected string');
   });
 
   test('rejects parameters that are neither object nor function', () => {
@@ -94,9 +80,16 @@ describe('dispatch & promise behaviour', () => {
     await expect(oxmysql.scalar('q', [1])).resolves.toBe(123);
   });
 
-  test('rejects when the server returns an error', async () => {
+  test('rejects with an Error when the server returns an error', async () => {
     nextError = 'boom';
-    await expect(oxmysql.update('q', [1])).rejects.toBe('boom');
+    await expect(oxmysql.update('q', [1])).rejects.toThrow('boom');
+  });
+
+  test('callback style receives the error as the second argument', async () => {
+    nextError = 'boom';
+    const args: unknown[][] = [];
+    await oxmysql.update('q', [1], (...a: unknown[]) => args.push(a));
+    expect(args).toEqual([[null, 'boom']]);
   });
 
   test('prepare and rawExecute dispatch to their server exports', async () => {

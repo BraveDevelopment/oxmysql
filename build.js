@@ -10,15 +10,6 @@ if (version) {
 }
 
 writeFileSync(
-  '.yarn.installed',
-  new Date().toLocaleString('en-AU', {
-    timeZone: 'UTC',
-    timeStyle: 'long',
-    dateStyle: 'full',
-  }),
-);
-
-writeFileSync(
   'fxmanifest.lua',
   `fx_version 'cerulean'
 game 'common'
@@ -47,14 +38,15 @@ files {
 
 ui_page 'web/build/index.html'
 
-provide 'mysql-async'
-provide 'ghmattimysql'
-
 convar_category 'OxMySQL' {
 	'Configuration',
 	{
 		{ 'Connection string', 'mysql_connection_string', 'CV_STRING', 'mysql://user:password@localhost/database' },
-		{ 'Debug', 'mysql_debug', 'CV_BOOL', 'false' }
+		{ 'Debug', 'mysql_debug', 'CV_BOOL', 'false' },
+		{ 'Transaction timeout (ms)', 'mysql_transaction_timeout', 'CV_INT', '30000' },
+		{ 'Connection acquire timeout (ms)', 'mysql_acquire_timeout', 'CV_INT', '10000' },
+		{ 'Deadlock retries', 'mysql_deadlock_retries', 'CV_INT', '3' },
+		{ 'Strict parameters', 'mysql_strict_params', 'CV_BOOL', 'false' }
 	}
 }
 `,

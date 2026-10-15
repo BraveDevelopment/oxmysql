@@ -1,16 +1,44 @@
-import { getConnection } from './connection';
-import { logError, logger, logQuery } from '../logger';
-import { CFXCallback, CFXParameters, TransactionQuery } from '../types';
+import { getConnection, type MySql } from './connection';
+import { invokeCallback, logError, logger, logQuery } from '../logger';
+import type { CFXCallback, CFXParameters, TransactionQuery } from '../types';
 import { parseTransaction } from '../utils/parseTransaction';
 import { setCallback } from '../utils/setCallback';
-import { performance } from 'perf_hooks';
 import { profileBatchStatements, runProfiler } from 'profiler';
+import { withRetry } from './retry';
+import { logRetry } from './logRetry';
 
-const transactionError = (queries: { query: string; params?: CFXParameters }[], parameters: CFXParameters) => {
-  return `${queries.map((query) => `${query.query} ${JSON.stringify(query.params || [])}`).join('\n')}\n${JSON.stringify(
+type ParsedTransaction = ReturnType<typeof parseTransaction>;
+
+const transactionError = (queries: ParsedTransaction, parameters: CFXParameters) =>
+  `${queries.map((query) => `${query.query} ${JSON.stringify(query.params || [])}`).join('\n')}\n${JSON.stringify(
     parameters,
   )}`;
-};
+
+async function runTransaction(connection: MySql, invokingResource: string, transactions: ParsedTransaction) {
+  const hasProfiler = await runProfiler(connection, invokingResource);
+
+  await connection.beginTransaction();
+
+  try {
+    for (let i = 0; i < transactions.length; i++) {
+      const transaction = transactions[i];
+      const startTime = hasProfiler ? 0 : performance.now();
+
+      await connection.query(transaction.query, transaction.params);
+
+      if (hasProfiler && ((i > 0 && i % 100 === 0) || i === transactions.length - 1)) {
+        await profileBatchStatements(connection, invokingResource, transactions, null, i < 100 ? 0 : i);
+      } else if (!hasProfiler) {
+        logQuery(invokingResource, transaction.query, performance.now() - startTime, transaction.params);
+      }
+    }
+
+    await connection.commit();
+  } catch (err) {
+    await connection.rollback().catch(() => {});
+    throw err;
+  }
+}
 
 export const rawTransaction = async (
   invokingResource: string,
@@ -19,8 +47,9 @@ export const rawTransaction = async (
   cb?: CFXCallback,
   isPromise?: boolean,
 ) => {
-  let transactions;
   cb = setCallback(parameters, cb);
+
+  let transactions: ParsedTransaction;
 
   try {
     transactions = parseTransaction(queries, parameters);
@@ -28,35 +57,19 @@ export const rawTransaction = async (
     return logError(invokingResource, cb, isPromise, err);
   }
 
-  await using connection = await getConnection();
-
-  if (!connection) return;
-
   let response = false;
 
   try {
-    const hasProfiler = await runProfiler(connection, invokingResource);
-    await connection.beginTransaction();
-    const transactionsLength = transactions.length;
+    await using connection = await getConnection();
 
-    for (let i = 0; i < transactionsLength; i++) {
-      const transaction = transactions[i];
-      const startTime = !hasProfiler && performance.now();
-      await connection.query(transaction.query, transaction.params);
-
-      if (hasProfiler && ((i > 0 && i % 100 === 0) || i === transactionsLength - 1)) {
-        await profileBatchStatements(connection, invokingResource, transactions, null, i < 100 ? 0 : i);
-      } else if (startTime) {
-        logQuery(invokingResource, transaction.query, performance.now() - startTime, transaction.params);
-      }
-    }
-
-    await connection.commit();
+    // the statement list is known up front, so the whole transaction can be repeated after a deadlock
+    await withRetry(
+      () => runTransaction(connection, invokingResource, transactions),
+      (err, attempt) => logRetry(invokingResource, transactions.map((t) => t.query).join('\n'), err, attempt),
+    );
 
     response = true;
   } catch (err: any) {
-    await connection.rollback().catch(() => {});
-
     const transactionErrorMessage = err.sql || transactionError(transactions, parameters);
     const msg = `${invokingResource} was unable to complete a transaction!\n${transactionErrorMessage}\n${err.message}`;
 
@@ -80,13 +93,7 @@ export const rawTransaction = async (
     });
   }
 
-  if (cb)
-    try {
-      cb(response);
-    } catch (err) {
-      if (typeof err === 'string') {
-        if (err.includes('SCRIPT ERROR:')) return console.log(err);
-        console.log(`^1SCRIPT ERROR in invoking resource ${invokingResource}: ${err}^0`);
-      }
-    }
+  if (!cb) return response;
+
+  invokeCallback(invokingResource, cb, response);
 };

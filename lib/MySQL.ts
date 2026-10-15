@@ -1,6 +1,5 @@
-type Query = string | number;
-type Params = Record<string, unknown> | unknown[] | Function;
-type Callback<T> = (result: T | null) => void;
+type Params = Record<string, unknown> | unknown[];
+type Callback<T> = (result: T | null, error?: string) => void;
 
 type Transaction =
   | string[]
@@ -23,58 +22,61 @@ interface Row {
   [column: string | number]: unknown;
 }
 
+type QueryFn<T> = (query: string, params?: Params | Callback<T>, cb?: Callback<T>) => Promise<T>;
+
 interface OxMySQL {
-  store: (query: string) => number;
   ready: (callback: () => void) => void;
-  query: <T = Result | null>(query: Query, params?: Params | Callback<T>, cb?: Callback<T>) => Promise<T>;
-  single: <T = Row | null>(
-    query: Query,
-    params?: Params | Callback<Exclude<T, []>>,
-    cb?: Callback<Exclude<T, []>>,
-  ) => Promise<Exclude<T, []>>;
-  scalar: <T = unknown | null>(
-    query: Query,
-    params?: Params | Callback<Exclude<T, []>>,
-    cb?: Callback<Exclude<T, []>>,
-  ) => Promise<Exclude<T, []>>;
-  update: <T = number | null>(query: Query, params?: Params | Callback<T>, cb?: Callback<T>) => Promise<T>;
-  insert: <T = number | null>(query: Query, params?: Params | Callback<T>, cb?: Callback<T>) => Promise<T>;
-  prepare: <T = any>(query: Query, params?: Params | Callback<T>, cb?: Callback<T>) => Promise<T>;
-  rawExecute: <T = Result | null>(query: Query, params?: Params | Callback<T>, cb?: Callback<T>) => Promise<T>;
-  transaction: (query: Transaction, params?: Params | Callback<boolean>, cb?: Callback<boolean>) => Promise<boolean>;
+  /** Rows for SELECT, otherwise the result header. */
+  query: <T = Row[] | Result>(...args: Parameters<QueryFn<T>>) => Promise<T>;
+  /** First row or null. Add `LIMIT 1` to the query. */
+  single: <T = Row | null>(...args: Parameters<QueryFn<T>>) => Promise<T>;
+  /** First column of the first row or null. */
+  scalar: <T = unknown>(...args: Parameters<QueryFn<T>>) => Promise<T>;
+  /** affectedRows */
+  update: (...args: Parameters<QueryFn<number | null>>) => Promise<number | null>;
+  /** insertId */
+  insert: (...args: Parameters<QueryFn<number | null>>) => Promise<number | null>;
+  /**
+   * Prepared statement. Rows for SELECT, insertId for INSERT/REPLACE, affectedRows for UPDATE/DELETE.
+   * An array of parameter sets runs as one atomic batch and returns one entry per set.
+   */
+  prepare: <T = any>(...args: Parameters<QueryFn<T>>) => Promise<T>;
+  /** Prepared statement returning the unprocessed result (one entry per set for batches). */
+  rawExecute: <T = Result | Row[]>(...args: Parameters<QueryFn<T>>) => Promise<T>;
+  transaction: (
+    queries: Transaction,
+    params?: Params | Callback<boolean>,
+    cb?: Callback<boolean>,
+  ) => Promise<boolean>;
   isReady: () => boolean;
   awaitConnection: () => Promise<true>;
+  /** Return false or throw to roll back. */
   startTransaction: (
-    cb: (query: <T = Result | null>(statement: string, params?: Params) => Promise<T>) => Promise<boolean | void>,
+    cb: (query: <T = Row[] | Result>(statement: string, params?: Params) => Promise<T>) => Promise<boolean | void>,
   ) => Promise<boolean>;
 }
-
-const QueryStore: string[] = [];
 
 function assert(condition: boolean, message: string) {
   if (!condition) throw new TypeError(message);
 }
 
-const safeArgs = (query: Query | Transaction, params?: any, cb?: Function, transaction?: true) => {
-  if (typeof query === 'number') {
-    query = QueryStore[query];
-    assert(typeof query === 'string', 'First argument received invalid query store reference');
-  }
-
+const safeArgs = (query: string | Transaction, params?: any, cb?: Function, transaction?: true) => {
   if (transaction) {
-    assert(typeof query === 'object', `First argument expected object, recieved ${typeof query}`);
+    assert(typeof query === 'object', `First argument expected object, received ${typeof query}`);
   } else {
     assert(typeof query === 'string', `First argument expected string, received ${typeof query}`);
   }
 
-  if (params) {
+  if (params !== undefined) {
     const paramType = typeof params;
+
     assert(
       paramType === 'object' || paramType === 'function',
       `Second argument expected object or function, received ${paramType}`,
     );
 
-    if (!cb && paramType === 'function') {
+    if (paramType === 'function') {
+      assert(cb === undefined, 'Received a callback as both the second and third argument');
       cb = params;
       params = undefined;
     }
@@ -82,20 +84,20 @@ const safeArgs = (query: Query | Transaction, params?: any, cb?: Function, trans
 
   if (cb !== undefined) assert(typeof cb === 'function', `Third argument expected function, received ${typeof cb}`);
 
-  return [query, params, cb];
+  return [query, params, cb] as const;
 };
 
 declare var global: any;
 const exp = global.exports.oxmysql;
 const currentResourceName = GetCurrentResourceName();
 
-function execute(method: string, query: Query | Transaction, params?: Params) {
+function execute(method: string, query: string | Transaction, params?: Params) {
   return new Promise((resolve, reject) => {
     exp[method](
       query,
       params,
-      (result, error) => {
-        if (error) return reject(error);
+      (result: unknown, error?: string) => {
+        if (error) return reject(new Error(error));
         resolve(result);
       },
       currentResourceName,
@@ -104,59 +106,40 @@ function execute(method: string, query: Query | Transaction, params?: Params) {
   }) as any;
 }
 
-export const oxmysql: OxMySQL = {
-  store(query) {
-    assert(typeof query === 'string', `Query expects a string, received ${typeof query}`);
+function method(name: string, transaction?: true) {
+  return async (query: any, params?: any, cb?: Function) => {
+    [query, params, cb] = safeArgs(query, params, cb, transaction);
 
-    // push() returns the new length; callers index QueryStore by position
-    return QueryStore.push(query) - 1;
-  },
+    let result: unknown;
+
+    try {
+      result = await execute(name, query, params);
+    } catch (err) {
+      // callback style receives errors as the second argument instead of an unhandled rejection
+      if (cb) return cb(null, (err as Error).message);
+      throw err;
+    }
+
+    return cb ? cb(result) : result;
+  };
+}
+
+export const oxmysql: OxMySQL = {
   ready(callback) {
     setImmediate(async () => {
       while (GetResourceState('oxmysql') !== 'started') await new Promise((resolve) => setTimeout(resolve, 50, null));
+      await exp.awaitConnection();
       callback();
     });
   },
-  async query(query, params, cb) {
-    [query, params, cb] = safeArgs(query, params, cb);
-    const result = await execute('query', query, params);
-    return cb ? cb(result) : result;
-  },
-  async single(query, params, cb) {
-    [query, params, cb] = safeArgs(query, params, cb);
-    const result = await execute('single', query, params);
-    return cb ? cb(result) : result;
-  },
-  async scalar(query, params, cb) {
-    [query, params, cb] = safeArgs(query, params, cb);
-    const result = await execute('scalar', query, params);
-    return cb ? cb(result) : result;
-  },
-  async update(query, params, cb) {
-    [query, params, cb] = safeArgs(query, params, cb);
-    const result = await execute('update', query, params);
-    return cb ? cb(result) : result;
-  },
-  async insert(query, params, cb) {
-    [query, params, cb] = safeArgs(query, params, cb);
-    const result = await execute('insert', query, params);
-    return cb ? cb(result) : result;
-  },
-  async prepare(query, params, cb) {
-    [query, params, cb] = safeArgs(query, params, cb);
-    const result = await execute('prepare', query, params);
-    return cb ? cb(result) : result;
-  },
-  async rawExecute(query, params, cb) {
-    [query, params, cb] = safeArgs(query, params, cb);
-    const result = await execute('rawExecute', query, params);
-    return cb ? cb(result) : result;
-  },
-  async transaction(query, params, cb) {
-    [query, params, cb] = safeArgs(query, params, cb, true);
-    const result = await execute('transaction', query, params);
-    return cb ? cb(result) : result;
-  },
+  query: method('query'),
+  single: method('single'),
+  scalar: method('scalar'),
+  update: method('update'),
+  insert: method('insert'),
+  prepare: method('prepare'),
+  rawExecute: method('rawExecute'),
+  transaction: method('transaction', true),
   isReady() {
     return exp.isReady();
   },
@@ -167,3 +150,5 @@ export const oxmysql: OxMySQL = {
     return exp.startTransaction(cb, currentResourceName);
   },
 };
+
+export default oxmysql;

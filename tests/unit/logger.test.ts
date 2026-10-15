@@ -118,3 +118,36 @@ describe('oxmysql:fetchResource net handler', () => {
     expect(emit![2].queries.every((q: any) => q.query.toLowerCase().includes('needle'))).toBe(true);
   });
 });
+
+describe('QueryRing', () => {
+  test('keeps the newest entries in order without shifting the array', async () => {
+    const { QueryRing } = await import('logger');
+    const ring = new QueryRing(3);
+    const entry = (n: number) => ({ query: `q${n}`, executionTime: n, date: n });
+
+    for (let i = 1; i <= 5; i++) ring.push(entry(i), 3);
+
+    expect(ring.length).toBe(3);
+    expect(ring.toArray().map((q) => q.query)).toEqual(['q3', 'q4', 'q5']);
+
+    // shrinking keeps the most recent entries
+    ring.push(entry(6), 2);
+    expect(ring.toArray().map((q) => q.query)).toEqual(['q5', 'q6']);
+  });
+});
+
+describe('callback errors', () => {
+  test('callback-style callers get (null, message) and the error is printed', async () => {
+    const { logError } = await import('logger');
+    const error = spyOn(console, 'error').mockImplementation(() => {});
+    const args: unknown[][] = [];
+
+    logError('res', (...a: unknown[]) => args.push(a), false, new Error('bad'), 'SELECT 1');
+
+    expect(args).toHaveLength(1);
+    expect(args[0][0]).toBeNull();
+    expect(String(args[0][1])).toContain('bad');
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
+  });
+});

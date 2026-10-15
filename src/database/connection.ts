@@ -1,29 +1,24 @@
 import type { Connection, PoolConnection } from 'mysql2/promise';
+import { mysql_acquire_timeout } from 'config';
 import { scheduleTick } from '../utils/scheduleTick';
-import { sleep } from '../utils/sleep';
-import { pool } from './pool';
+import { pool, poolReady } from './pool';
 import type { CFXParameters } from 'types';
-import { typeCastExecute } from 'utils/typeCast';
-
-(Symbol as any).dispose ??= Symbol('Symbol.dispose');
-(Symbol as any).asyncDispose ??= Symbol('Symbol.asyncDispose');
-
-const activeConnections: Record<string, MySql> = {};
 
 interface PromisePoolConnection extends Connection {
   connection: PoolConnection;
   release: PoolConnection['release'];
+  destroy: PoolConnection['destroy'];
 }
 
 export class MySql {
   id: number;
   connection: PromisePoolConnection;
   transaction?: boolean;
+  destroyed?: boolean;
 
   constructor(connection: PromisePoolConnection) {
     this.id = connection.connection.threadId;
     this.connection = connection;
-    activeConnections[this.id] = this;
   }
 
   async query(query: string, values: CFXParameters = []) {
@@ -36,11 +31,8 @@ export class MySql {
   async execute(query: string, values: CFXParameters = []) {
     scheduleTick();
 
-    const [result] = await this.connection.execute({
-      sql: query,
-      values: values,
-      typeCast: typeCastExecute,
-    });
+    // typecasting comes from the pool config and applies to both protocols
+    const [result] = await this.connection.execute(query, values);
     return result;
   }
 
@@ -59,29 +51,63 @@ export class MySql {
     return this.connection.commit();
   }
 
+  /**
+   * Closes the socket and removes the connection from the pool. The server rolls back any open
+   * transaction and releases its locks; in-flight queries fail.
+   */
+  destroy() {
+    if (this.destroyed) return;
+
+    this.destroyed = true;
+    delete this.transaction;
+    this.connection.destroy();
+  }
+
   async [Symbol.asyncDispose]() {
+    if (this.destroyed) return;
+
     // never silently commit a transaction the caller left open; roll it back
     if (this.transaction) await this.rollback().catch(() => {});
 
-    delete activeConnections[this.id];
     this.connection.release();
   }
 }
 
-export async function getConnection(connectionId?: number) {
-  while (!pool) await sleep(0);
-
-  if (connectionId) {
-    const existing = activeConnections[connectionId];
-    if (!existing) return;
-
-    // Borrowed connection: its owner is responsible for commit/rollback and
-    // release, so the borrow site must not dispose it. Hand back a non-owning
-    // view whose disposer is a no-op.
-    return Object.assign(Object.create(existing) as MySql, {
-      async [Symbol.asyncDispose]() {},
-    });
+export class AcquireTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`Timed out after ${ms}ms waiting for a free database connection (pool exhausted).`);
   }
+}
 
-  return new MySql((await pool.getConnection()) as unknown as PromisePoolConnection);
+async function acquire(): Promise<PromisePoolConnection> {
+  const pending = pool!.getConnection() as unknown as Promise<PromisePoolConnection>;
+
+  if (!mysql_acquire_timeout) return pending;
+
+  let timer: NodeJS.Timeout | undefined;
+  let timedOut = false;
+
+  try {
+    return await Promise.race([
+      pending,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          reject(new AcquireTimeoutError(mysql_acquire_timeout));
+        }, mysql_acquire_timeout);
+      }),
+    ]);
+  } catch (err) {
+    // the pool may still hand us the connection later; give it straight back
+    if (timedOut) pending.then((connection) => connection.release()).catch(() => {});
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function getConnection() {
+  if (!pool) await poolReady;
+
+  return new MySql(await acquire());
 }
